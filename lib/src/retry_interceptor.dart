@@ -2,7 +2,8 @@ import 'dart:async';
 
 import 'package:dio/dio.dart';
 
-import 'http_status_codes.dart';
+import 'package:dio_smart_retry/src/default_retry_evaluator.dart';
+import 'package:dio_smart_retry/src/http_status_codes.dart';
 
 typedef RetryEvaluator = FutureOr<bool> Function(DioError error, int attempt);
 
@@ -19,13 +20,27 @@ class RetryInterceptor extends Interceptor {
     ],
     RetryEvaluator? retryEvaluator,
     this.ignoreRetryEvaluatorExceptions = false,
-  }) : _retryEvaluator = retryEvaluator ?? defaultRetryEvaluator;
+    this.retryableExtraStatuses = const {},
+  }) : _retryEvaluator = retryEvaluator ??
+            DefaultRetryEvaluator({
+              ...defaultRetryableStatuses,
+              ...retryableExtraStatuses,
+            }).evaluate {
+    if (retryEvaluator != null && retryableExtraStatuses.isNotEmpty) {
+      throw ArgumentError(
+        '[retryableExtraStatuses] works only if [retryEvaluator] is null.'
+            ' Set either [retryableExtraStatuses] or [retryEvaluator].'
+            ' Not both.',
+        'retryableExtraStatuses',
+      );
+    }
+  }
 
   /// The original dio
   final Dio dio;
 
   /// For logging purpose
-  final Function(String message)? logPrint;
+  final void Function(String message)? logPrint;
 
   /// The number of retry in case of an error
   final int retries;
@@ -37,43 +52,36 @@ class RetryInterceptor extends Interceptor {
   /// Empty [retryDelays] means no delay.
   ///
   /// If [retries] count more than [retryDelays] count,
-  /// the last element value of [retryDelays] will be used.
+  ///   the last element value of [retryDelays] will be used.
   final List<Duration> retryDelays;
 
   /// Evaluating if a retry is necessary.regarding the error.
   ///
   /// It can be a good candidate for additional operations too, like
-  /// updating authentication token in case of a unauthorized error
-  /// (be careful with concurrency though).
+  ///   updating authentication token in case of a unauthorized error
+  ///   (be careful with concurrency though).
   ///
-  /// Defaults to [defaultRetryEvaluator].
+  /// Defaults to [DefaultRetryEvaluator.evaluate]
+  ///   with [defaultRetryableStatuses].
   final RetryEvaluator _retryEvaluator;
 
-  /// Returns true only if the response hasn't been cancelled or got
-  /// a bad status code.
-  // ignore: avoid-unused-parameters
-  static FutureOr<bool> defaultRetryEvaluator(DioError error, int attempt) {
-    bool shouldRetry;
-    if (error.type == DioErrorType.response) {
-      final statusCode = error.response?.statusCode;
-      if (statusCode != null) {
-        shouldRetry = isRetryable(statusCode);
-      } else {
-        shouldRetry = true;
-      }
-    } else {
-      shouldRetry = error.type != DioErrorType.cancel
-                  && error.error is! FormatException;
-    }
-    return shouldRetry;
-  }
+  /// Specifies an extra retryable statuses,
+  ///   which will be taken into account with [defaultRetryableStatuses]
+  /// IMPORTANT: THIS SETTING WORKS ONLY IF [_retryEvaluator] is null
+  final Set<int> retryableExtraStatuses;
+
+  /// Redirects to [DefaultRetryEvaluator.evaluate]
+  ///   with [defaultRetryableStatuses]
+  static final FutureOr<bool> Function(DioError error, int attempt)
+      defaultRetryEvaluator =
+      DefaultRetryEvaluator(defaultRetryableStatuses).evaluate;
 
   Future<bool> _shouldRetry(DioError error, int attempt) async {
     try {
       return await _retryEvaluator(error, attempt);
-    } catch(e) {
+    } catch (e) {
       logPrint?.call('There was an exception in _retryEvaluator: $e');
-      if(!ignoreRetryEvaluatorExceptions) {
+      if (!ignoreRetryEvaluatorExceptions) {
         rethrow;
       }
     }
@@ -81,10 +89,12 @@ class RetryInterceptor extends Interceptor {
   }
 
   @override
-  Future onError(DioError err, ErrorInterceptorHandler handler) async {
+  Future<dynamic> onError(DioError err, ErrorInterceptorHandler handler) async {
     if (err.requestOptions.disableRetry) {
       return super.onError(err, handler);
     }
+    bool isRequestedCancelled() =>
+        err.requestOptions.cancelToken?.isCancelled == true;
 
     final attempt = err.requestOptions._attempt + 1;
     final shouldRetry = attempt <= retries && await _shouldRetry(err, attempt);
@@ -106,9 +116,14 @@ class RetryInterceptor extends Interceptor {
     if (delay != Duration.zero) {
       await Future<void>.delayed(delay);
     }
+    if (isRequestedCancelled()) {
+      logPrint?.call('Request was cancelled. Cancel retrying.');
+      return super.onError(err, handler);
+    }
 
     try {
-      await dio.fetch<void>(err.requestOptions)
+      await dio
+          .fetch<void>(err.requestOptions)
           .then((value) => handler.resolve(value));
     } on DioError catch (e) {
       super.onError(e, handler);
@@ -123,9 +138,10 @@ class RetryInterceptor extends Interceptor {
   }
 }
 
+const _kDisableRetryKey = 'ro_disable_retry';
+
 extension RequestOptionsX on RequestOptions {
   static const _kAttemptKey = 'ro_attempt';
-  static const _kDisableRetryKey = 'ro_disable_retry';
 
   int get _attempt => (extra[_kAttemptKey] as int?) ?? 0;
 
@@ -134,4 +150,10 @@ extension RequestOptionsX on RequestOptions {
   bool get disableRetry => (extra[_kDisableRetryKey] as bool?) ?? false;
 
   set disableRetry(bool value) => extra[_kDisableRetryKey] = value;
+}
+
+extension OptionsX on Options {
+  bool get disableRetry => (extra?[_kDisableRetryKey] as bool?) ?? false;
+
+  set disableRetry(bool value) => extra?[_kDisableRetryKey] = value;
 }

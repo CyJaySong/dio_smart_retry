@@ -1,6 +1,11 @@
+## 1.3.2
+- Add a feature allowing to specify extra retryable status codes (parameter `retryableExtraStatuses`) (#11)
+- Add a request's `CancelToken` checking
+- Update dependencies
+
 ## 1.2.0
 
-- Add properly incorrect url scheme error handling in default evaluator (#2)
+- Add properly an incorrect url scheme error handling in the default  retry evaluator (#2)
 
 ## 1.1.0
 
